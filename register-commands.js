@@ -1,290 +1,238 @@
-const XLSX = require("xlsx");
+const {
+  AttachmentBuilder,
+  Client,
+  Events,
+  GatewayIntentBits,
+  MessageFlags
+} = require("discord.js");
+const config = require("./config");
+const { parseMissingMembersWorkbook } = require("./parseMissingMembers");
+const { buildReminderMessage } = require("./reminderMessage");
+const { registerCommands } = require("./register-commands");
 
-const SHEET_NAME = "Missing members";
-
-const COLUMN_ALIASES = {
-  playerName: ["playername", "name", "membername", "ingamename", "spelernaam", "player"],
-  playerTag: ["playertag", "tag", "membertag", "spelertag", "playertags"],
-  discord: [
-    "discord",
-    "discordid",
-    "discorduserid",
-    "discorduser",
-    "discordusername",
-    "discordname",
-    "discordmention",
-    "user",
-    "userid",
-    "id"
-  ],
-  clan: ["clan", "clanname"],
-  clanTag: ["clantag"]
-};
-
-function normalize(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function findMissingSheetName(workbook) {
-  const exact = workbook.SheetNames.find((name) => normalize(name) === normalize(SHEET_NAME));
-  if (exact) return exact;
+function hasAllowedRole(interaction) {
+  if (!interaction.guild || !interaction.member) return false;
 
-  return workbook.SheetNames.find((name) => {
-    const normalized = normalize(name);
-    return normalized.includes("missing") && normalized.includes("member");
-  });
-}
+  const rawRoles = interaction.member.roles;
+  const memberRoleIds = Array.isArray(rawRoles) ? rawRoles : [...rawRoles.cache.keys()];
 
-function scoreHeaderRow(cells) {
-  const normalizedCells = cells.map(normalize).filter(Boolean);
-  let score = 0;
-
-  for (const names of Object.values(COLUMN_ALIASES)) {
-    if (normalizedCells.some((cell) => names.includes(cell))) score += 1;
+  if (config.allowedRoleIds.length > 0) {
+    const allowedIds = new Set(config.allowedRoleIds);
+    if (memberRoleIds.some((roleId) => allowedIds.has(roleId))) return true;
   }
 
-  if (normalizedCells.some((cell) => cell.includes("discord"))) score += 2;
-  if (normalizedCells.some((cell) => cell.includes("player") || cell.includes("member"))) score += 1;
-
-  return score;
-}
-
-function findHeaderRow(matrix) {
-  let best = { index: -1, score: 0 };
-  const scanLimit = Math.min(matrix.length, 25);
-
-  for (let index = 0; index < scanLimit; index += 1) {
-    const score = scoreHeaderRow(matrix[index] || []);
-    if (score > best.score) best = { index, score };
+  if (config.allowedRoleNames.length > 0) {
+    return memberRoleIds.some((roleId) => {
+      const role = interaction.guild.roles.cache.get(roleId);
+      return role && config.allowedRoleNames.includes(role.name.toLowerCase());
+    });
   }
 
-  return best.score >= 2 ? best.index : -1;
+  return false;
 }
 
-function findColumn(headers, aliases, fuzzyText) {
-  const normalizedHeaders = headers.map(normalize);
-
-  for (const alias of aliases) {
-    const index = normalizedHeaders.indexOf(alias);
-    if (index !== -1) return index;
+async function downloadAttachment(attachment) {
+  const filename = attachment.name || "";
+  if (!filename.toLowerCase().endsWith(".xlsx")) {
+    throw new Error("Upload een Excel-bestand met .xlsx als extensie.");
   }
 
-  if (fuzzyText) {
-    const index = normalizedHeaders.findIndex((header) => header.includes(fuzzyText));
-    if (index !== -1) return index;
+  const response = await fetch(attachment.url);
+  if (!response.ok) {
+    throw new Error(`Ik kon het Excel-bestand niet downloaden (${response.status}).`);
   }
 
-  return -1;
+  return Buffer.from(await response.arrayBuffer());
 }
 
-function cell(row, index) {
-  if (index === -1) return "";
-  return String(row[index] || "").trim();
+function formatMember(member) {
+  const name = member.playerName || "Onbekende speler";
+  const tag = member.playerTag ? ` (${member.playerTag})` : "";
+  const clan = member.clan ? ` - ${member.clan}` : "";
+  const discord = member.discordId ? `<@${member.discordId}>` : member.discord || "geen Discord ID";
+  return `${name}${tag}${clan} -> ${discord}`;
 }
 
-function extractDiscordId(...values) {
-  for (const value of values) {
-    const text = String(value || "").trim();
-    const mention = text.match(/<@!?(\d{16,22})>/);
-    if (mention) return mention[1];
+function buildReport({ dryRun, parsed, sendResults }) {
+  const lines = [];
+  lines.push(`CWL reminder rapport`);
+  lines.push(`Modus: ${dryRun ? "dry-run, geen DM's verstuurd" : "DM's verstuurd"}`);
+  lines.push(`Tabblad: ${parsed.sheetName}`);
+  lines.push(`Aantal regels in Missing members: ${parsed.members.length}`);
+  lines.push("");
 
-    const plainId = text.match(/\b(\d{16,22})\b/);
-    if (plainId) return plainId[1];
+  if (dryRun) {
+    const withId = parsed.members.filter((member) => member.discordId);
+    const withoutId = parsed.members.filter((member) => !member.discordId);
+
+    lines.push(`Kan DM'en: ${withId.length}`);
+    lines.push(`Geen Discord User ID gevonden: ${withoutId.length}`);
+    lines.push("");
+    lines.push("Zouden een DM krijgen:");
+    lines.push(...withId.map(formatMember));
+
+    if (withoutId.length > 0) {
+      lines.push("");
+      lines.push("Overgeslagen omdat Discord User ID ontbreekt:");
+      lines.push(...withoutId.map(formatMember));
+    }
+  } else {
+    lines.push(`Verzonden: ${sendResults.sent.length}`);
+    lines.push(`Mislukt: ${sendResults.failed.length}`);
+    lines.push(`Overgeslagen: ${sendResults.skipped.length}`);
+    lines.push("");
+
+    if (sendResults.sent.length > 0) {
+      lines.push("Verzonden:");
+      lines.push(...sendResults.sent.map((result) => formatMember(result.member)));
+      lines.push("");
+    }
+
+    if (sendResults.failed.length > 0) {
+      lines.push("Mislukt:");
+      lines.push(
+        ...sendResults.failed.map((result) => `${formatMember(result.member)} | ${result.reason}`)
+      );
+      lines.push("");
+    }
+
+    if (sendResults.skipped.length > 0) {
+      lines.push("Overgeslagen:");
+      lines.push(
+        ...sendResults.skipped.map((result) => `${formatMember(result.member)} | ${result.reason}`)
+      );
+    }
   }
 
-  return "";
+  return lines.join("\n");
 }
 
-function normalizePlayerTag(value) {
-  return String(value || "")
-    .trim()
-    .toUpperCase()
-    .replace(/^#/, "")
-    .replace(/[^A-Z0-9]/g, "");
-}
+async function sendReminders(client, parsed) {
+  const sendableMembers = parsed.members.filter((member) => member.discordId);
+  const skipped = parsed.members
+    .filter((member) => !member.discordId)
+    .map((member) => ({ member, reason: "Geen Discord User ID gevonden." }));
 
-function normalizePlayerName(value) {
-  return normalize(value);
-}
+  const membersToSend = sendableMembers.slice(0, config.maxDmsPerRun);
+  const capped = sendableMembers.slice(config.maxDmsPerRun).map((member) => ({
+    member,
+    reason: `Niet verstuurd door MAX_DMS_PER_RUN=${config.maxDmsPerRun}.`
+  }));
 
-function readSheetMatrix(workbook, sheetName) {
-  const sheet = workbook.Sheets[sheetName];
-  return XLSX.utils.sheet_to_json(sheet, {
-    header: 1,
-    defval: "",
-    raw: false,
-    blankrows: false
-  });
-}
+  const sent = [];
+  const failed = [];
 
-function parseMissingMembersWorkbook(buffer) {
-  const workbook = XLSX.read(buffer, { type: "buffer", raw: false });
-  const sheetName = findMissingSheetName(workbook);
-
-  if (!sheetName) {
-    throw new Error(`Ik kan het tabblad "${SHEET_NAME}" niet vinden in dit Excel-bestand.`);
-  }
-
-  const matrix = readSheetMatrix(workbook, sheetName);
-
-  const headerRowIndex = findHeaderRow(matrix);
-  if (headerRowIndex === -1) {
-    throw new Error(`Ik kan de kolomkoppen in tabblad "${sheetName}" niet herkennen.`);
-  }
-
-  const headers = matrix[headerRowIndex].map((value) => String(value || "").trim());
-  const columns = {
-    playerName: findColumn(headers, COLUMN_ALIASES.playerName, "name"),
-    playerTag: findColumn(headers, COLUMN_ALIASES.playerTag, "tag"),
-    discord: findColumn(headers, COLUMN_ALIASES.discord, "discord"),
-    clan: findColumn(headers, COLUMN_ALIASES.clan, "clan"),
-    clanTag: findColumn(headers, COLUMN_ALIASES.clanTag, "clantag")
-  };
-
-  const members = matrix
-    .slice(headerRowIndex + 1)
-    .map((row, index) => {
-      const discord = cell(row, columns.discord);
-      const playerName = cell(row, columns.playerName);
-      const playerTag = cell(row, columns.playerTag);
-      const clan = cell(row, columns.clan);
-      const clanTag = cell(row, columns.clanTag);
-
-      return {
-        rowNumber: headerRowIndex + index + 2,
-        discord,
-        discordId: extractDiscordId(discord),
-        discordSource: extractDiscordId(discord) ? "Missing members" : "",
-        playerName,
-        playerTag,
-        normalizedPlayerTag: normalizePlayerTag(playerTag),
-        normalizedPlayerName: normalizePlayerName(playerName),
-        clan,
-        clanTag
-      };
-    })
-    .filter((member) => member.discord || member.playerName || member.playerTag);
-
-  return {
-    sheetName,
-    headers,
-    columns,
-    members
-  };
-}
-
-function parseMemberMappingWorkbook(buffer) {
-  const workbook = XLSX.read(buffer, { type: "buffer", raw: false });
-  const rows = [];
-
-  for (const sheetName of workbook.SheetNames) {
-    const matrix = readSheetMatrix(workbook, sheetName);
-    const headerRowIndex = findHeaderRow(matrix);
-    if (headerRowIndex === -1) continue;
-
-    const headers = matrix[headerRowIndex].map((value) => String(value || "").trim());
-    const columns = {
-      playerName: findColumn(headers, COLUMN_ALIASES.playerName, "name"),
-      playerTag: findColumn(headers, COLUMN_ALIASES.playerTag, "tag"),
-      discord: findColumn(headers, COLUMN_ALIASES.discord, "discord")
-    };
-
-    if (columns.discord === -1) continue;
-    if (columns.playerTag === -1 && columns.playerName === -1) continue;
-
-    for (const [index, row] of matrix.slice(headerRowIndex + 1).entries()) {
-      const discord = cell(row, columns.discord);
-      const discordId = extractDiscordId(discord);
-      const playerName = cell(row, columns.playerName);
-      const playerTag = cell(row, columns.playerTag);
-
-      if (!discordId || (!playerTag && !playerName)) continue;
-
-      rows.push({
-        sheetName,
-        rowNumber: headerRowIndex + index + 2,
-        discord,
-        discordId,
-        playerName,
-        playerTag,
-        normalizedPlayerTag: normalizePlayerTag(playerTag),
-        normalizedPlayerName: normalizePlayerName(playerName)
+  for (const member of membersToSend) {
+    try {
+      const user = await client.users.fetch(member.discordId);
+      const message = buildReminderMessage(config.reminderMessage, member, user);
+      await user.send(message);
+      sent.push({ member });
+    } catch (error) {
+      failed.push({
+        member,
+        reason: error?.message || "Onbekende fout bij DM versturen."
       });
     }
-  }
 
-  const byTag = new Map();
-  const byName = new Map();
-  const duplicateNames = new Set();
-
-  for (const row of rows) {
-    if (row.normalizedPlayerTag && !byTag.has(row.normalizedPlayerTag)) {
-      byTag.set(row.normalizedPlayerTag, row);
-    }
-
-    if (row.normalizedPlayerName) {
-      if (byName.has(row.normalizedPlayerName)) duplicateNames.add(row.normalizedPlayerName);
-      else byName.set(row.normalizedPlayerName, row);
-    }
-  }
-
-  for (const name of duplicateNames) {
-    byName.delete(name);
+    await sleep(config.dmDelayMs);
   }
 
   return {
-    rows,
-    byTag,
-    byName,
-    duplicateNames
+    sent,
+    failed,
+    skipped: [...skipped, ...capped]
   };
 }
 
-function applyMemberMapping(parsed, mapping) {
-  if (!mapping) return parsed;
-
-  for (const member of parsed.members) {
-    if (member.discordId) continue;
-
-    const byTag = member.normalizedPlayerTag
-      ? mapping.byTag.get(member.normalizedPlayerTag)
-      : null;
-    const byName = member.normalizedPlayerName
-      ? mapping.byName.get(member.normalizedPlayerName)
-      : null;
-
-    if (byTag) {
-      member.discord = byTag.discord;
-      member.discordId = byTag.discordId;
-      member.discordSource = `ledenbestand: player tag, ${byTag.sheetName} rij ${byTag.rowNumber}`;
-      continue;
-    }
-
-    if (byName) {
-      member.discord = byName.discord;
-      member.discordId = byName.discordId;
-      member.discordSource = `ledenbestand: unieke spelernaam, ${byName.sheetName} rij ${byName.rowNumber}`;
-      continue;
-    }
-
-    if (member.normalizedPlayerName && mapping.duplicateNames.has(member.normalizedPlayerName)) {
-      member.mappingIssue = "Spelernaam komt meerdere keren voor in ledenbestand.";
-    }
+async function handleRemindUnregistered(interaction, client) {
+  if (interaction.guildId !== config.guildId) {
+    await interaction.reply({
+      content: "Deze command is alleen ingesteld voor jullie eigen server.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
   }
 
-  parsed.mapping = {
-    totalRows: mapping.rows.length,
-    duplicateNameCount: mapping.duplicateNames.size
-  };
+  if (!hasAllowedRole(interaction)) {
+    await interaction.reply({
+      content: "Je hebt geen toegestane beheerrol voor deze command.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
 
-  return parsed;
+  const dryRun = interaction.options.getBoolean("dry_run", true);
+  const attachment = interaction.options.getAttachment("file", true);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const buffer = await downloadAttachment(attachment);
+  const parsed = parseMissingMembersWorkbook(buffer);
+
+  let sendResults = null;
+  if (!dryRun) {
+    sendResults = await sendReminders(client, parsed);
+  }
+
+  const report = buildReport({ dryRun, parsed, sendResults });
+  const reportFile = new AttachmentBuilder(Buffer.from(report, "utf8"), {
+    name: dryRun ? "cwl-reminder-dry-run.txt" : "cwl-reminder-resultaat.txt"
+  });
+
+  const sendableCount = parsed.members.filter((member) => member.discordId).length;
+  const summary = dryRun
+    ? `Dry-run klaar. Ik vond ${parsed.members.length} regels in Missing members; ${sendableCount} daarvan hebben een Discord User ID.`
+    : `Klaar. Verzonden: ${sendResults.sent.length}, mislukt: ${sendResults.failed.length}, overgeslagen: ${sendResults.skipped.length}.`;
+
+  await interaction.editReply({
+    content: summary,
+    files: [reportFile]
+  });
 }
 
-module.exports = {
-  applyMemberMapping,
-  parseMemberMappingWorkbook,
-  parseMissingMembersWorkbook
-};
+if (!config.discordToken) {
+  throw new Error("DISCORD_TOKEN ontbreekt in je environment.");
+}
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+client.once(Events.ClientReady, (readyClient) => {
+  console.log(`Ingelogd als ${readyClient.user.tag}`);
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== "remind-unregistered") return;
+
+  try {
+    await handleRemindUnregistered(interaction, client);
+  } catch (error) {
+    const message = error?.message || "Er ging iets mis.";
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: `Fout: ${message}`, files: [] });
+    } else {
+      await interaction.reply({ content: `Fout: ${message}`, flags: MessageFlags.Ephemeral });
+    }
+  }
+});
+
+async function main() {
+  if (config.registerCommandsOnStart) {
+    await registerCommands();
+  }
+
+  await client.login(config.discordToken);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
